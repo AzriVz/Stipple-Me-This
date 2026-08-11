@@ -1,0 +1,6 @@
+build/
+stipple
+output/
+sample/
+*.o
+*.exe
