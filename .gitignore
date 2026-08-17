@@ -1,6 +1,7 @@
 build/
 stipple
-output/
+output/*
+!output/*.png
 sample/
 *.o
 *.exe
