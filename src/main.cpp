@@ -1,13 +1,14 @@
 #include "stipple.hpp"
 #include "image.hpp"
+#include "gui.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
-#include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -50,9 +51,10 @@ static void printUsage() {
         "  --seed <int>      Seed RNG (default: 42)\n"
         "  --gif <path>      Simpan animasi tiap iterasi ke file GIF\n"
         "  --gif-every <k>   Rekam 1 frame tiap k iterasi (default: 1)\n"
+        "  --gui             Buka antarmuka grafis\n"
         "  --quiet           Tanpa output progress\n"
         "\n"
-        "Tanpa argumen: mode interaktif (TUI) untuk memasukkan parameter.\n");
+        "Tanpa argumen juga akan membuka antarmuka grafis (GUI).\n");
 }
 
 static std::string fmtMs(double ms) {
@@ -65,20 +67,22 @@ static bool isTty() { return isatty(fileno(stderr)); }
 static void printProgress(int iter, int maxIter, float disp, double iterMs,
                           double elapsedMs, bool quiet) {
     if (quiet) return;
-    if (!isTty() || iter == 0) {
-
+    if (!isTty()) {
         std::fprintf(stderr, "iter %4d/%d  max_disp=%.4f  %.1f ms/iter  elapsed=%s\n",
                      iter + 1, maxIter, disp, iterMs, fmtMs(elapsedMs).c_str());
         return;
     }
-    const int barW = 24;
+    const int barW = 28;
     int filled = (int)((iter + 1) / (double)maxIter * barW);
     if (filled > barW) filled = barW;
     std::string bar;
     for (int i = 0; i < barW; ++i) bar += (i < filled) ? '#' : '-';
     double eta = elapsedMs / (iter + 1) * (maxIter - iter - 1);
-    std::fprintf(stderr, "\r\033[K[%s] iter %4d/%d  max_disp=%.4f  %.1f ms/iter  ETA %s",
-                 bar.c_str(), iter + 1, maxIter, disp, iterMs, fmtMs(eta).c_str());
+    int percent = (int)std::round((iter + 1) * 100.0 / maxIter);
+    std::fprintf(stderr,
+                 "\r\033[K[%s] %3d%% | iter %d/%d | max_disp %.4f | %.1f ms | ETA %s",
+                 bar.c_str(), percent, iter + 1, maxIter, disp, iterMs,
+                 fmtMs(eta).c_str());
     std::fflush(stderr);
 }
 
@@ -95,6 +99,7 @@ struct Config {
     uint64_t seed = 42;
     bool bench = false;
     bool quiet = false;
+    bool gui = false;
 };
 
 static bool parseArgs(int argc, char** argv, Config& cfg, bool& printHelp) {
@@ -121,6 +126,7 @@ static bool parseArgs(int argc, char** argv, Config& cfg, bool& printHelp) {
         else if (a == "--gif") cfg.gifPath = next("--gif");
         else if (a == "--gif-every") cfg.gifEvery = std::atoi(next("--gif-every"));
         else if (a == "--bench") cfg.bench = true;
+        else if (a == "--gui") cfg.gui = true;
         else if (a == "--quiet") cfg.quiet = true;
         else if (a == "--help" || a == "-h") { printHelp = true; return true; }
         else {
@@ -134,8 +140,22 @@ static bool parseArgs(int argc, char** argv, Config& cfg, bool& printHelp) {
 
 static bool validate(const Config& cfg) {
     if (cfg.input.empty() || cfg.numPoints <= 0 || cfg.maxIter <= 0 ||
-        cfg.epsilon < 0.0f || cfg.output.empty()) {
+        !std::isfinite(cfg.epsilon) || cfg.epsilon < 0.0f || cfg.output.empty()) {
         std::fprintf(stderr, "Error: semua 5 parameter wajib harus diisi.\n\n");
+        return false;
+    }
+    if (cfg.implName != "serial" && cfg.implName != "openmp" &&
+        cfg.implName != "simd" && cfg.implName != "cuda") {
+        std::fprintf(stderr,
+                     "Error: implementasi '%s' tidak valid (pilih serial/openmp/simd/cuda).\n",
+                     cfg.implName.c_str());
+        return false;
+    }
+    if (!std::isfinite(cfg.gamma) || cfg.gamma <= 0.0f ||
+        !std::isfinite(cfg.radiusScale) || cfg.radiusScale <= 0.0f ||
+        !std::isfinite(cfg.edgeWeight) || cfg.edgeWeight < 0.0f ||
+        cfg.gifEvery <= 0 || cfg.threads < 0) {
+        std::fprintf(stderr, "Error: nilai opsi numerik tidak valid.\n");
         return false;
     }
     return true;
@@ -183,7 +203,7 @@ static RunResult runOnce(const RunArgs& a, std::vector<float>& xs,
     }
 
     if (a.p.maxIter > 0 && !a.quiet) {
-        std::fprintf(stderr, "\r\033[K");
+        if (isTty()) std::fprintf(stderr, "\r\033[K");
         std::fprintf(stderr,
                      "%s: %d iterasi, %s, %.2f ms/iter rata-rata, "
                      "max_disp akhir=%.4f (%s)\n",
@@ -253,37 +273,13 @@ static void runBenchmark(const Config& cfg, const Image& img) {
     std::printf("\n");
 }
 
-static bool interactive(Config& cfg) {
-    std::string line;
-    auto ask = [&](const char* prompt) -> std::string {
-        std::printf("%s", prompt);
-        std::fflush(stdout);
-        if (!std::getline(std::cin, line)) std::exit(0);
-        return line;
-    };
-
-    std::printf("=== Stipple Me This: mode interaktif ===\n");
-    cfg.input = ask("Path gambar input : ");
-    cfg.numPoints = std::atoi(ask("Jumlah titik      : ").c_str());
-    cfg.maxIter = std::atoi(ask("Maksimal iterasi  : ").c_str());
-    cfg.epsilon = (float)std::atof(ask("Epsilon           : ").c_str());
-    cfg.output = ask("Path output       : ");
-    std::printf("Implementasi [serial/openmp/simd/cuda]: ");
-    std::fflush(stdout);
-    if (!std::getline(std::cin, line)) std::exit(0);
-    if (!line.empty()) cfg.implName = line;
-    return true;
-}
-
 int main(int argc, char** argv) {
     Config cfg;
     bool help = false;
     if (!parseArgs(argc, argv, cfg, help)) return 1;
     if (help) { printUsage(); return 0; }
 
-    if (argc == 1) {
-        if (!interactive(cfg)) return 1;
-    }
+    if (argc == 1 || cfg.gui) return runGui(argc, argv);
 
     if (!validate(cfg)) { printUsage(); return 1; }
 
